@@ -25,6 +25,13 @@ class Database:
                 encrypted_password BLOB NOT NULL
             )
         ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS profile (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                username TEXT NOT NULL,
+                avatar_path TEXT NOT NULL DEFAULT ''
+            )
+        ''')
         self.conn.commit()
 
     def is_vault_initialized(self) -> bool:
@@ -53,3 +60,20 @@ class Database:
     def delete_credential(self, cred_id):
         self.cursor.execute("DELETE FROM credentials WHERE id = ?", (cred_id,))
         self.conn.commit()
+
+    def save_profile(self, username, avatar_path=""):
+        self.cursor.execute(
+            "INSERT OR REPLACE INTO profile (id, username, avatar_path) VALUES (1, ?, ?)",
+            (username, avatar_path)
+        )
+        self.conn.commit()
+
+    def get_profile(self):
+        self.cursor.execute("SELECT username, avatar_path FROM profile WHERE id = 1")
+        return self.cursor.fetchone()
+
+    def get_category_counts(self):
+        self.cursor.execute(
+            "SELECT category, COUNT(*) FROM credentials GROUP BY category ORDER BY category"
+        )
+        return self.cursor.fetchall()
