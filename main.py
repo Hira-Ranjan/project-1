@@ -3,6 +3,8 @@ import random
 import string
 import os
 import pyperclip
+from tkinter import filedialog
+from PIL import Image, ImageDraw, ImageOps
 
 
 from database import Database
@@ -17,10 +19,12 @@ class AddEditCredentialModal(ctk.CTkToplevel):
     """Modal popup for adding a new encrypted credential."""
     def __init__(self, parent, on_save_callback):
         super().__init__(parent)
+        self.transient(parent)
         self.title("Add New Credential")
         self.geometry("450x500")
         self.resizable(False, False)
         self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.close)
 
         self.on_save_callback = on_save_callback
 
@@ -61,20 +65,37 @@ class AddEditCredentialModal(ctk.CTkToplevel):
         self.show_pass_btn = ctk.CTkButton(pass_frame, text="👁", width=40, command=self.toggle_password)
         self.show_pass_btn.pack(side="right")
 
+        ctk.CTkButton(pass_frame, text="Generate", width=85, command=self.open_generator).pack(side="right", padx=(0, 5))
+
         self.error_label = ctk.CTkLabel(form_frame, text="", text_color="#FF4D4D")
         self.error_label.pack(pady=5)
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=30, pady=15)
 
-        ctk.CTkButton(btn_frame, text="Cancel", fg_color="#555555", hover_color="#333333", width=110, command=self.destroy).pack(side="left")
+        ctk.CTkButton(btn_frame, text="Cancel", fg_color="#555555", hover_color="#333333", width=110, command=self.close).pack(side="left")
         ctk.CTkButton(btn_frame, text="Save Entry", width=110, command=self.save_data).pack(side="right")
+
+    def close(self):
+        self.grab_release()
+        self.destroy()
+        if self.master.winfo_exists():
+            self.master.grab_set()
+            self.master.focus_set()
 
     def toggle_password(self):
         if self.pass_entry.cget("show") == "*":
             self.pass_entry.configure(show="")
         else:
             self.pass_entry.configure(show="*")
+
+    def open_generator(self):
+        PasswordGeneratorModal(self, on_generated=self.use_generated_password)
+
+    def use_generated_password(self, password):
+        self.pass_entry.delete(0, "end")
+        self.pass_entry.insert(0, password)
+        self.pass_entry.configure(show="*")
 
     def save_data(self):
         cat = self.cat_menu.get()
@@ -87,17 +108,20 @@ class AddEditCredentialModal(ctk.CTkToplevel):
             return
 
         self.on_save_callback(cat, service, user, pwd)
-        self.destroy()
+        self.close()
 
 
 class PasswordGeneratorModal(ctk.CTkToplevel):
     """Modal utility for generating random passwords."""
-    def __init__(self, parent):
+    def __init__(self, parent, on_generated=None):
         super().__init__(parent)
+        self.transient(parent)
         self.title("Password Generator")
         self.geometry("400x380")
         self.resizable(False, False)
         self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.on_generated = on_generated
 
         self.update_idletasks()
         x = parent.winfo_x() + (parent.winfo_width() // 2) - (400 // 2)
@@ -112,8 +136,14 @@ class PasswordGeneratorModal(ctk.CTkToplevel):
         ctrl_frame = ctk.CTkFrame(self, fg_color="transparent")
         ctrl_frame.pack(fill="x", padx=30, pady=10)
 
-        self.len_label = ctk.CTkLabel(ctrl_frame, text="Length: 16", anchor="w")
-        self.len_label.pack(fill="x")
+        length_row = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        length_row.pack(fill="x")
+        ctk.CTkLabel(length_row, text="Length:", anchor="w").pack(side="left")
+        self.length_entry = ctk.CTkEntry(length_row, width=70, justify="center")
+        self.length_entry.insert(0, "16")
+        self.length_entry.pack(side="right")
+        self.length_entry.bind("<Return>", self.update_length_from_entry)
+        self.length_entry.bind("<FocusOut>", self.update_length_from_entry)
         self.slider = ctk.CTkSlider(ctrl_frame, from_=8, to=32, number_of_steps=24, command=self.update_length)
         self.slider.set(16)
         self.slider.pack(fill="x", pady=(0, 15))
@@ -124,6 +154,15 @@ class PasswordGeneratorModal(ctk.CTkToplevel):
         ctk.CTkSwitch(ctrl_frame, text="Include Special Symbols (@#$%)", variable=self.symbols_var, command=self.generate).pack(anchor="w", pady=4)
         ctk.CTkSwitch(ctrl_frame, text="Include Numbers (0-9)", variable=self.numbers_var, command=self.generate).pack(anchor="w", pady=4)
 
+        symbols_row = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        symbols_row.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(symbols_row, text="Minimum special symbols:").pack(side="left")
+        self.min_symbols_entry = ctk.CTkEntry(symbols_row, width=70, justify="center")
+        self.min_symbols_entry.insert(0, "1")
+        self.min_symbols_entry.pack(side="right")
+        self.min_symbols_entry.bind("<Return>", self.update_min_symbols)
+        self.min_symbols_entry.bind("<FocusOut>", self.update_min_symbols)
+
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=30, pady=20)
 
@@ -133,34 +172,84 @@ class PasswordGeneratorModal(ctk.CTkToplevel):
         self.generate()
 
     def update_length(self, value):
-        self.len_label.configure(text=f"Length: {int(value)}")
+        length = int(value)
+        self.length_entry.delete(0, "end")
+        self.length_entry.insert(0, str(length))
+        self.generate()
+
+    def update_length_from_entry(self, event=None):
+        try:
+            length = max(8, min(32, int(self.length_entry.get())))
+        except ValueError:
+            length = 16
+        self.slider.set(length)
+        self.length_entry.delete(0, "end")
+        self.length_entry.insert(0, str(length))
+        self.generate()
+
+    def update_min_symbols(self, event=None):
+        try:
+            minimum = int(self.min_symbols_entry.get())
+        except ValueError:
+            minimum = 1
+        maximum = int(self.length_entry.get())
+        minimum = max(0, min(maximum, minimum)) if self.symbols_var.get() else 0
+        self.min_symbols_entry.delete(0, "end")
+        self.min_symbols_entry.insert(0, str(minimum))
         self.generate()
 
     def generate(self):
         chars = string.ascii_letters
         if self.numbers_var.get():
             chars += string.digits
+        symbols = "!@#$%^&*()_+-="
         if self.symbols_var.get():
-            chars += "!@#$%^&*()_+-="
+            chars += symbols
 
-        length = int(self.slider.get())
-        pwd = "".join(random.choice(chars) for _ in range(length))
+        try:
+            length = max(8, min(32, int(self.length_entry.get())))
+        except ValueError:
+            length = 16
+        try:
+            minimum_symbols = int(self.min_symbols_entry.get())
+        except ValueError:
+            minimum_symbols = 1
+        minimum_symbols = max(0, min(length, minimum_symbols)) if self.symbols_var.get() else 0
+
+        password_chars = [random.choice(symbols) for _ in range(minimum_symbols)]
+        password_chars.extend(random.choice(chars) for _ in range(length - minimum_symbols))
+        random.shuffle(password_chars)
+        pwd = "".join(password_chars)
         
         self.output_entry.delete(0, "end")
         self.output_entry.insert(0, pwd)
 
     def copy_and_close(self):
-        pyperclip.copy(self.output_entry.get())
+        password = self.output_entry.get()
+        pyperclip.copy(password)
+        if self.on_generated:
+            self.on_generated(password)
+        self.close()
+
+    def close(self):
+        self.grab_release()
         self.destroy()
+        if self.master.winfo_exists():
+            self.master.focus_set()
 
 
 class PasswordManagerApp(ctk.CTk):
     def __init__(self):
-        super().__init__()
+        super().__init__(className="LocalVault")
 
+        self.tk.call("tk", "appname", "local-vault")
         self.title("Local Vault Password Manager")
         self.geometry("900x600")
         self.resizable(False, False)
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - 900) // 2
+        y = (self.winfo_screenheight() - 600) // 2
+        self.geometry(f"900x600+{x}+{y}")
 
         # Database & Key State
         self.db = Database()
@@ -179,7 +268,7 @@ class PasswordManagerApp(ctk.CTk):
 
         self.master_key = None  # Clear key from RAM when locked
 
-        auth_card = ctk.CTkFrame(self, width=420, height=380, corner_radius=15)
+        auth_card = ctk.CTkFrame(self, width=420, height=450, corner_radius=15)
         auth_card.place(relx=0.5, rely=0.5, anchor="center")
 
         if not self.db.is_vault_initialized():
@@ -189,6 +278,9 @@ class PasswordManagerApp(ctk.CTk):
 
             self.setup_pass = ctk.CTkEntry(auth_card, placeholder_text="New Master Password...", show="*", width=300, height=38)
             self.setup_pass.pack(pady=8)
+
+            self.setup_username = ctk.CTkEntry(auth_card, placeholder_text="Username...", width=300, height=38)
+            self.setup_username.pack(pady=8)
 
             self.confirm_pass = ctk.CTkEntry(auth_card, placeholder_text="Confirm Master Password...", show="*", width=300, height=38)
             self.confirm_pass.pack(pady=8)
@@ -215,9 +307,10 @@ class PasswordManagerApp(ctk.CTk):
     def handle_setup(self):
         p1 = self.setup_pass.get()
         p2 = self.confirm_pass.get()
+        username = self.setup_username.get().strip()
 
-        if not p1 or not p2:
-            self.error_label.configure(text="Please fill in both password fields!")
+        if not p1 or not p2 or not username:
+            self.error_label.configure(text="Username and both password fields are required!")
             return
         if p1 != p2:
             self.error_label.configure(text="Passwords do not match!")
@@ -232,6 +325,7 @@ class PasswordManagerApp(ctk.CTk):
         verifier = crypto_utils.encrypt_data("VERIFY_VAULT", key)
 
         self.db.save_master_meta(salt, verifier)
+        self.db.save_profile(username)
         self.master_key = key
         self.show_dashboard_screen()
 
@@ -253,6 +347,18 @@ class PasswordManagerApp(ctk.CTk):
                 self.error_label.configure(text="Incorrect Master Password!")
         except Exception:
             self.error_label.configure(text="Incorrect Master Password!")
+
+    def get_avatar_image(self, avatar_path, size=58):
+        if not avatar_path or not os.path.exists(avatar_path):
+            return None
+        try:
+            image = ImageOps.fit(Image.open(avatar_path).convert("RGBA"), (size, size), method=Image.Resampling.LANCZOS)
+            mask = Image.new("L", (size, size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+            image.putalpha(mask)
+            return ctk.CTkImage(light_image=image, dark_image=image, size=(size, size))
+        except Exception:
+            return None
 
     def show_dashboard_screen(self):
         """Renders Main Dashboard."""
@@ -276,6 +382,27 @@ class PasswordManagerApp(ctk.CTk):
             btn.pack(side="left", padx=4)
             self.cat_buttons[category] = btn
 
+        profile = self.db.get_profile()
+        profile_name = profile[0] if profile else "Profile"
+        initials = "".join(part[0] for part in profile_name.split()[:2]).upper() or "P"
+        profile_control = ctk.CTkFrame(top_bar, fg_color="transparent")
+        profile_control.pack(side="right", padx=4)
+        avatar_image = self.get_avatar_image(profile[1] if profile else "")
+        profile_button = ctk.CTkButton(
+            profile_control,
+            text="" if avatar_image else initials,
+            image=avatar_image,
+            width=62,
+            height=62,
+            corner_radius=31,
+            fg_color="transparent" if avatar_image else "#1F6AA5",
+            hover_color="#2B7DB8",
+            font=("Arial", 16, "bold"),
+            command=self.show_profile_screen
+        )
+        profile_button.pack()
+        profile_button.image = avatar_image
+        ctk.CTkLabel(profile_control, text=profile_name, font=("Arial", 11)).pack()
         ctk.CTkButton(top_bar, text="🔒 Lock", width=70, height=30, fg_color="#D9534F", hover_color="#A52A2A", command=self.show_auth_screen).pack(side="right", padx=4)
 
         # TOOLBAR
@@ -397,6 +524,51 @@ class PasswordManagerApp(ctk.CTk):
     def delete_record(self, rec_id):
         self.db.delete_credential(rec_id)
         self.refresh_records_list()
+
+    def show_profile_screen(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        profile = self.db.get_profile() or ("Profile", "")
+        username, avatar_path = profile
+        initials = "".join(part[0] for part in username.split()[:2]).upper() or "P"
+
+        ctk.CTkButton(self, text="Back to Vault", width=120, command=self.show_dashboard_screen).pack(anchor="nw", padx=25, pady=20)
+        ctk.CTkLabel(self, text="Your Profile", font=("Arial", 26, "bold")).pack(pady=(5, 15))
+
+        avatar = ctk.CTkLabel(self, text=initials, width=150, height=150, corner_radius=75,
+                              fg_color="#1F6AA5", font=("Arial", 42, "bold"))
+        if avatar_path and os.path.exists(avatar_path):
+            try:
+                image = ImageOps.fit(Image.open(avatar_path).convert("RGB"), (150, 150), method=Image.Resampling.LANCZOS)
+                avatar_image = ctk.CTkImage(light_image=image, dark_image=image, size=(150, 150))
+                avatar.configure(text="", image=avatar_image, fg_color="transparent", corner_radius=0)
+                avatar.image = avatar_image
+            except Exception:
+                pass
+        avatar.pack(pady=10)
+
+        ctk.CTkLabel(self, text=username, font=("Arial", 20, "bold")).pack(pady=5)
+        ctk.CTkButton(self, text="Choose Profile Picture", command=self.choose_avatar).pack(pady=12)
+
+        total_entries = len(self.db.get_all_credentials())
+        stats_frame = ctk.CTkFrame(self, fg_color="transparent")
+        stats_frame.pack(fill="x", padx=100, pady=25)
+        ctk.CTkLabel(stats_frame, text=f"Total Entries\n{total_entries}", font=("Arial", 18, "bold")).pack(side="left", expand=True)
+
+        categories = self.db.get_category_counts()
+        category_text = "\n".join(f"{category}: {count}" for category, count in categories) or "No entries yet"
+        ctk.CTkLabel(stats_frame, text=f"Entry Types\n{category_text}", justify="left", font=("Arial", 15)).pack(side="right", expand=True)
+
+    def choose_avatar(self):
+        selected_path = filedialog.askopenfilename(
+            title="Choose Profile Picture",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif"), ("All files", "*.*")]
+        )
+        if selected_path:
+            profile = self.db.get_profile() or ("Profile", "")
+            self.db.save_profile(profile[0], selected_path)
+            self.show_profile_screen()
 
     def open_add_modal(self):
         AddEditCredentialModal(self, on_save_callback=self.save_new_record)
