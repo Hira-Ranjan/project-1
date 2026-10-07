@@ -2,8 +2,11 @@ import customtkinter as ctk
 import random
 import string
 import os
+import re
+import time
+import tkinter as tk
 import pyperclip
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageDraw, ImageOps
 
 
@@ -13,20 +16,26 @@ import crypto_utils
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+_rng = random.SystemRandom()  # cryptographically secure RNG for generated passwords
+AUTO_LOCK_OPTIONS = {"1 minute": 1, "2 minutes": 2, "5 minutes": 5, "10 minutes": 10,
+                     "15 minutes": 15, "30 minutes": 30, "Never": 0}
+DEFAULT_AUTO_LOCK_MINUTES = 5
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class AddEditCredentialModal(ctk.CTkToplevel):
     """Modal popup for adding a new encrypted credential."""
-    def __init__(self, parent, on_save_callback):
+    def __init__(self, parent, on_save_callback, record=None):
         super().__init__(parent)
         self.transient(parent)
-        self.title("Add New Credential")
+        self.title("Edit Credential" if record else "Add New Credential")
         self.geometry("450x500")
         self.resizable(False, False)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self.close)
 
         self.on_save_callback = on_save_callback
+        self.record = record
 
         # Center popup on parent
         self.update_idletasks()
@@ -34,7 +43,7 @@ class AddEditCredentialModal(ctk.CTkToplevel):
         y = parent.winfo_y() + (parent.winfo_height() // 2) - (500 // 2)
         self.geometry(f"+{x}+{y}")
 
-        ctk.CTkLabel(self, text="Add New Credential", font=("Arial", 18, "bold")).pack(pady=(20, 15))
+        ctk.CTkLabel(self, text="Edit Credential" if record else "Add New Credential", font=("Arial", 18, "bold")).pack(pady=(20, 15))
 
         form_frame = ctk.CTkFrame(self, fg_color="transparent")
         form_frame.pack(fill="both", expand=True, padx=30)
@@ -70,11 +79,21 @@ class AddEditCredentialModal(ctk.CTkToplevel):
         self.error_label = ctk.CTkLabel(form_frame, text="", text_color="#FF4D4D")
         self.error_label.pack(pady=5)
 
+        if record:
+            self.cat_menu.set(record["category"])
+            self.service_entry.insert(0, record["service"])
+            self.user_entry.insert(0, record["username"])
+            self.pass_entry.insert(0, record["password"])
+
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=30, pady=15)
 
         ctk.CTkButton(btn_frame, text="Cancel", fg_color="#555555", hover_color="#333333", width=110, command=self.close).pack(side="left")
-        ctk.CTkButton(btn_frame, text="Save Entry", width=110, command=self.save_data).pack(side="right")
+        ctk.CTkButton(btn_frame, text="Update Entry" if record else "Save Entry", width=110, command=self.save_data).pack(side="right")
+
+        for entry in (self.service_entry, self.user_entry, self.pass_entry):
+            entry.bind("<Return>", lambda e: self.save_data())
+        self.after(100, lambda: PasswordManagerApp.safe_focus(self.service_entry))
 
     def close(self):
         self.grab_release()
@@ -107,7 +126,7 @@ class AddEditCredentialModal(ctk.CTkToplevel):
             self.error_label.configure(text="Service and Password are required!")
             return
 
-        self.on_save_callback(cat, service, user, pwd)
+        self.on_save_callback(cat, service, user, pwd, self.record["id"] if self.record else None)
         self.close()
 
 
@@ -216,9 +235,9 @@ class PasswordGeneratorModal(ctk.CTkToplevel):
             minimum_symbols = 1
         minimum_symbols = max(0, min(length, minimum_symbols)) if self.symbols_var.get() else 0
 
-        password_chars = [random.choice(symbols) for _ in range(minimum_symbols)]
-        password_chars.extend(random.choice(chars) for _ in range(length - minimum_symbols))
-        random.shuffle(password_chars)
+        password_chars = [_rng.choice(symbols) for _ in range(minimum_symbols)]
+        password_chars.extend(_rng.choice(chars) for _ in range(length - minimum_symbols))
+        _rng.shuffle(password_chars)
         pwd = "".join(password_chars)
         
         self.output_entry.delete(0, "end")
@@ -254,99 +273,312 @@ class PasswordManagerApp(ctk.CTk):
         # Database & Key State
         self.db = Database()
         self.master_key = None  # Ephemeral 256-bit key kept in RAM while unlocked
+        self.current_email = ""  # Email of the account that is (or was last) logged in
+        self.remembered_email = self.db.get_setting("remembered_email", "") or ""
+        self._status_after_id = None     # pending footer-message reset
+        self._last_activity = time.monotonic()  # last mouse/keyboard activity (for auto-lock)
+        try:
+            self.auto_lock_minutes = int(self.db.get_setting("auto_lock_minutes", DEFAULT_AUTO_LOCK_MINUTES))
+        except ValueError:
+            self.auto_lock_minutes = DEFAULT_AUTO_LOCK_MINUTES
+        self._clipboard_after_id = None  # pending clipboard auto-clear
 
         self.current_category_filter = "All"
         self.current_search_query = ""
 
+        # Any mouse/keyboard activity (in any window or popup) resets the inactivity timer
+        for sequence in ("<Motion>", "<KeyPress>", "<ButtonPress>", "<MouseWheel>"):
+            self.bind_all(sequence, self._on_activity, add="+")
+        self.after(1000, self._check_inactivity)
+
         # Launch appropriate screen
         self.show_auth_screen()
 
-    def show_auth_screen(self):
-        """Renders either First-Time Setup or Returning Login View."""
+    def show_auth_screen(self, mode=None, prefill_email=None, notice=""):
+        """Renders Create Account or Login view. mode: 'create' | 'login' (auto if None)."""
         for widget in self.winfo_children():
             widget.destroy()
 
         self.master_key = None  # Clear key from RAM when locked
+        self.db.account_id = None
+        self.current_category_filter = "All"
+        self.current_search_query = ""
+        if self._status_after_id:
+            self.after_cancel(self._status_after_id)
+            self._status_after_id = None
 
-        auth_card = ctk.CTkFrame(self, width=420, height=450, corner_radius=15)
+        has_accounts = self.db.is_vault_initialized()
+        if mode is None:
+            mode = "login" if has_accounts else "create"
+        if prefill_email is None:
+            prefill_email = self.current_email or self.remembered_email
+
+        if mode == "create":
+            auth_card = ctk.CTkFrame(self, width=740, height=530, corner_radius=15)
+        else:
+            remembered = bool(prefill_email) and prefill_email == self.remembered_email
+            auth_card = ctk.CTkFrame(self, width=420, height=390 if remembered else 450, corner_radius=15)
+        auth_card.pack_propagate(False)
         auth_card.place(relx=0.5, rely=0.5, anchor="center")
 
-        if not self.db.is_vault_initialized():
-            # FIRST TIME SETUP
-            ctk.CTkLabel(auth_card, text="Create Master Vault", font=("Arial", 22, "bold")).pack(pady=(25, 5))
-            ctk.CTkLabel(auth_card, text="Set a master key to encrypt your local database", text_color="gray").pack(pady=(0, 15))
+        if mode == "create":
+            # CREATE ACCOUNT (first time, or adding another account on this device)
+            ctk.CTkLabel(auth_card, text="Create Account", font=("Arial", 22, "bold")).pack(pady=(25, 4))
+            ctk.CTkLabel(auth_card, text="Your master password encrypts everything in this vault, so choose it carefully.",
+                         text_color="gray").pack(pady=(0, 14))
 
-            self.setup_pass = ctk.CTkEntry(auth_card, placeholder_text="New Master Password...", show="*", width=300, height=38)
-            self.setup_pass.pack(pady=8)
+            body = ctk.CTkFrame(auth_card, fg_color="transparent")
+            body.pack(padx=30, fill="x")
 
-            self.setup_username = ctk.CTkEntry(auth_card, placeholder_text="Username...", width=300, height=38)
-            self.setup_username.pack(pady=8)
+            # Left: form
+            form = ctk.CTkFrame(body, fg_color="transparent")
+            form.pack(side="left", anchor="n")
 
-            self.confirm_pass = ctk.CTkEntry(auth_card, placeholder_text="Confirm Master Password...", show="*", width=300, height=38)
-            self.confirm_pass.pack(pady=8)
+            self.setup_email = ctk.CTkEntry(form, placeholder_text="Email...", width=300, height=38)
+            self.setup_email.pack(pady=6)
+
+            self.setup_username = ctk.CTkEntry(form, placeholder_text="Username...", width=300, height=38)
+            self.setup_username.pack(pady=6)
+
+            pass_row = ctk.CTkFrame(form, fg_color="transparent")
+            pass_row.pack(pady=6)
+            self.setup_pass = ctk.CTkEntry(pass_row, placeholder_text="New Master Password...", show="*", width=252, height=38)
+            self.setup_pass.pack(side="left")
+            ctk.CTkButton(pass_row, text="👁", width=40, height=38,
+                          command=lambda: self.toggle_master_visibility(self.setup_pass, self.confirm_pass)).pack(side="left", padx=(8, 0))
+
+            self.confirm_pass = ctk.CTkEntry(form, placeholder_text="Confirm Master Password...", show="*", width=300, height=38)
+            self.confirm_pass.pack(pady=6)
+
+            self.remember_email_var = ctk.BooleanVar(value=False)
+            ctk.CTkCheckBox(
+                form,
+                text="Remember this email on this device",
+                variable=self.remember_email_var
+            ).pack(anchor="w", pady=(2, 6))
+
+            # Right: live strength meter + requirements checklist
+            panel = ctk.CTkFrame(body, fg_color="#242424", corner_radius=10)
+            panel.pack(side="right", fill="both", expand=True, padx=(20, 0))
+
+            ctk.CTkLabel(panel, text="Password strength", font=("Arial", 13, "bold"), anchor="w").pack(fill="x", padx=15, pady=(12, 4))
+            self.strength_bar = ctk.CTkProgressBar(panel, height=8)
+            self.strength_bar.set(0)
+            self.strength_bar.pack(fill="x", padx=15)
+            self.strength_label = ctk.CTkLabel(panel, text="Start typing a password", text_color="gray", anchor="w", font=("Arial", 12))
+            self.strength_label.pack(fill="x", padx=15, pady=(4, 8))
+
+            self.rule_labels = {}
+            rule_defs = [(k, d) for k, d, _ in crypto_utils.check_password_strength("")["rules"]]
+            rule_defs.append(("match", "Both passwords match"))
+            for key, desc in rule_defs:
+                lbl = ctk.CTkLabel(panel, text=f"○  {desc}", text_color="gray", anchor="w", font=("Arial", 12))
+                lbl.pack(fill="x", padx=15, pady=2)
+                self.rule_labels[key] = (lbl, desc)
+            ctk.CTkLabel(panel, text="Tip: a longer passphrase is stronger.", text_color="gray",
+                         anchor="w", font=("Arial", 11)).pack(fill="x", padx=15, pady=(6, 10))
 
             self.error_label = ctk.CTkLabel(auth_card, text="", text_color="#FF4D4D")
-            self.error_label.pack(pady=5)
+            self.error_label.pack(pady=(10, 4))
 
-            ctk.CTkButton(auth_card, text="Create Vault & Continue", width=300, height=40, fg_color="#2FA572", command=self.handle_setup).pack(pady=10)
+            self.setup_btn = ctk.CTkButton(auth_card, text="Create Account & Continue", width=300, height=40,
+                                           fg_color="#2FA572", hover_color="#1E704C", state="disabled", command=self.handle_setup)
+            self.setup_btn.pack(pady=6)
+
+            if has_accounts:
+                ctk.CTkButton(auth_card, text="← Back to login", width=300, fg_color="transparent", text_color="#3B8ED0",
+                              hover_color="#2B2B2B", command=lambda: self.show_auth_screen(mode="login")).pack()
+
+            for entry in (self.setup_email, self.setup_username, self.setup_pass, self.confirm_pass):
+                entry.bind("<Return>", lambda e: self.handle_setup())
+            self.setup_pass.bind("<KeyRelease>", self.update_strength_meter)
+            self.confirm_pass.bind("<KeyRelease>", self.update_strength_meter)
+            self.update_strength_meter()
+            self.after(100, lambda: self.safe_focus(self.setup_email))
 
         else:
             # RETURNING USER LOGIN
-            ctk.CTkLabel(auth_card, text="Welcome Back", font=("Arial", 22, "bold")).pack(pady=(35, 5))
-            ctk.CTkLabel(auth_card, text="Enter Master Password to unlock", text_color="gray").pack(pady=(0, 20))
+            remembered = bool(prefill_email) and prefill_email == self.remembered_email
+            if remembered:
+                ctk.CTkLabel(auth_card, text="Welcome Back", font=("Arial", 22, "bold")).pack(pady=(40, 5))
+                ctk.CTkLabel(auth_card, text=f"Unlock vault for {prefill_email}", text_color="gray").pack(pady=(0, 20))
 
-            self.master_pass_entry = ctk.CTkEntry(auth_card, placeholder_text="Master Password...", show="*", width=300, height=40)
-            self.master_pass_entry.pack(pady=10)
-            self.master_pass_entry.bind("<Return>", lambda e: self.handle_login())
+                pass_row = ctk.CTkFrame(auth_card, fg_color="transparent")
+                pass_row.pack(pady=10)
+                self.master_pass_entry = ctk.CTkEntry(pass_row, placeholder_text="Master Password...", show="*", width=252, height=40)
+                self.master_pass_entry.pack(side="left")
+                self.master_pass_entry.bind("<Return>", lambda e: self.handle_login())
+                ctk.CTkButton(pass_row, text="👁", width=40, height=40,
+                              command=lambda: self.toggle_master_visibility(self.master_pass_entry)).pack(side="left", padx=(8, 0))
 
-            ctk.CTkButton(auth_card, text="Unlock Vault", width=300, height=40, command=self.handle_login).pack(pady=15)
+                ctk.CTkButton(auth_card, text="Unlock Vault", width=300, height=40, command=self.handle_login).pack(pady=15)
 
-            self.error_label = ctk.CTkLabel(auth_card, text="", text_color="#FF4D4D")
-            self.error_label.pack(pady=5)
+                self.error_label = ctk.CTkLabel(auth_card, text="", text_color="#FF4D4D")
+                self.error_label.pack(pady=5)
+
+                ctk.CTkButton(auth_card, text="Use another account", width=300, fg_color="transparent", text_color="#3B8ED0",
+                              hover_color="#2B2B2B", command=lambda: self.show_auth_screen(mode="login", prefill_email="")).pack()
+
+                self.login_email_entry = None
+                self.after(100, lambda: self.safe_focus(self.master_pass_entry))
+            else:
+                ctk.CTkLabel(auth_card, text="Welcome Back", font=("Arial", 22, "bold")).pack(pady=(35, 5))
+                ctk.CTkLabel(auth_card, text="Enter your email and master password to unlock", text_color="gray").pack(pady=(0, 20))
+
+                self.login_email_entry = ctk.CTkEntry(auth_card, placeholder_text="Email...", width=300, height=40)
+                self.login_email_entry.pack(pady=10)
+                self.login_email_entry.bind("<Return>", lambda e: self.handle_login())
+
+                pass_row = ctk.CTkFrame(auth_card, fg_color="transparent")
+                pass_row.pack(pady=10)
+                self.master_pass_entry = ctk.CTkEntry(pass_row, placeholder_text="Master Password...", show="*", width=252, height=40)
+                self.master_pass_entry.pack(side="left")
+                self.master_pass_entry.bind("<Return>", lambda e: self.handle_login())
+                ctk.CTkButton(pass_row, text="👁", width=40, height=40,
+                              command=lambda: self.toggle_master_visibility(self.master_pass_entry)).pack(side="left", padx=(8, 0))
+
+                ctk.CTkButton(auth_card, text="Unlock Vault", width=300, height=40, command=self.handle_login).pack(pady=15)
+
+                self.error_label = ctk.CTkLabel(auth_card, text="", text_color="#FF4D4D")
+                self.error_label.pack(pady=5)
+
+                ctk.CTkButton(auth_card, text="+ Create new account", width=300, fg_color="transparent", text_color="#3B8ED0",
+                              hover_color="#2B2B2B", command=lambda: self.show_auth_screen(mode="create")).pack()
+
+                if prefill_email:
+                    self.login_email_entry.insert(0, prefill_email)
+                    self.after(100, lambda: self.safe_focus(self.master_pass_entry))
+                else:
+                    self.after(100, lambda: self.safe_focus(self.login_email_entry))
+
+        if notice and mode == "login":
+            self.error_label.configure(text=notice, text_color="#F0AD4E")
+
+    @staticmethod
+    def safe_focus(widget):
+        """Focus a widget, ignoring the case where its screen was already replaced."""
+        try:
+            widget.focus_set()
+        except Exception:
+            pass
+
+    def toggle_master_visibility(self, *entries):
+        """Show/hide the master password field(s)."""
+        hidden = entries[0].cget("show") == "*"
+        for entry in entries:
+            entry.configure(show="" if hidden else "*")
+
+    def update_strength_meter(self, event=None):
+        """Live-updates the strength bar, requirement checklist and the Create button."""
+        pwd = self.setup_pass.get()
+        confirm = self.confirm_pass.get()
+        result = crypto_utils.check_password_strength(pwd)
+
+        for key, _desc, ok in result["rules"]:
+            lbl, desc = self.rule_labels[key]
+            lbl.configure(text=f"{'✓' if ok else '○'}  {desc}", text_color="#2FA572" if ok else "gray")
+
+        match_ok = bool(confirm) and pwd == confirm
+        lbl, desc = self.rule_labels["match"]
+        if confirm and not match_ok:
+            lbl.configure(text=f"✗  {desc}", text_color="#FF4D4D")
+        else:
+            lbl.configure(text=f"{'✓' if match_ok else '○'}  {desc}", text_color="#2FA572" if match_ok else "gray")
+
+        self.strength_bar.set(result["score"])
+        self.strength_bar.configure(progress_color=result["color"] if pwd else "#3B8ED0")
+        self.strength_label.configure(
+            text=f"Strength: {result['label']}" if pwd else "Start typing a password",
+            text_color=result["color"]
+        )
+        self.setup_btn.configure(state="normal" if result["acceptable"] and match_ok else "disabled")
+
+    def show_auth_error(self, message):
+        self.error_label.configure(text=message, text_color="#FF4D4D")
+
+    def show_auth_busy(self, message):
+        """Key derivation takes a moment (by design), so tell the user something is happening."""
+        self.error_label.configure(text=message, text_color="gray")
+        self.update_idletasks()
 
     def handle_setup(self):
+        email = self.setup_email.get().strip().lower()
         p1 = self.setup_pass.get()
         p2 = self.confirm_pass.get()
         username = self.setup_username.get().strip()
 
-        if not p1 or not p2 or not username:
-            self.error_label.configure(text="Username and both password fields are required!")
+        if not email or not p1 or not p2 or not username:
+            self.show_auth_error("Email, username and both password fields are required!")
+            return
+        if not EMAIL_PATTERN.match(email):
+            self.show_auth_error("Please enter a valid email address!")
+            return
+        if not crypto_utils.check_password_strength(p1)["acceptable"]:
+            self.show_auth_error("Master password doesn't meet all the requirements yet.")
             return
         if p1 != p2:
-            self.error_label.configure(text="Passwords do not match!")
+            self.show_auth_error("Passwords do not match!")
             return
-        if len(p1) < 6:
-            self.error_label.configure(text="Master password must be at least 6 chars!")
+        if self.db.get_account_by_email(email):
+            self.show_auth_error("An account with this email already exists!")
             return
+
+        self.show_auth_busy("Creating your encrypted vault…")
 
         # Initialize Master Security Metadata
         salt = crypto_utils.os.urandom(16)
         key = crypto_utils.derive_key(p1, salt)
         verifier = crypto_utils.encrypt_data("VERIFY_VAULT", key)
 
-        self.db.save_master_meta(salt, verifier)
-        self.db.save_profile(username)
+        account_id = self.db.create_account(email, username, salt, verifier)
+        if account_id is None:
+            self.show_auth_error("An account with this email already exists!")
+            return
+
+        self.db.account_id = account_id
+        self.current_email = email
+        if self.remember_email_var.get():
+            self.db.set_setting("remembered_email", email)
+            self.remembered_email = email
+        else:
+            self.db.set_setting("remembered_email", "")
+            self.remembered_email = ""
         self.master_key = key
         self.show_dashboard_screen()
 
     def handle_login(self):
-        entered_pass = self.master_pass_entry.get().strip()
-        if not entered_pass:
-            self.error_label.configure(text="Please enter your master password!")
+        if self.login_email_entry is None:
+            email = self.remembered_email.lower()
+        else:
+            email = self.login_email_entry.get().strip().lower()
+        entered_pass = self.master_pass_entry.get()  # not stripped: must match exactly what was set
+        if not email or not entered_pass:
+            self.show_auth_error("Please enter your email and master password!")
             return
 
-        salt, verifier = self.db.get_master_meta()
+        account = self.db.get_account_by_email(email)
+        if not account:
+            self.show_auth_error("No account found with this email!")
+            return
+
+        account_id, salt, verifier = account
+        self.show_auth_busy("Unlocking…")
         key = crypto_utils.derive_key(entered_pass, salt)
 
         try:
-            decrypted_check = crypto_utils.decrypt_data(verifier, key)
-            if decrypted_check == "VERIFY_VAULT":
-                self.master_key = key
-                self.show_dashboard_screen()
-            else:
-                self.error_label.configure(text="Incorrect Master Password!")
+            ok = crypto_utils.decrypt_data(verifier, key) == "VERIFY_VAULT"
         except Exception:
-            self.error_label.configure(text="Incorrect Master Password!")
+            ok = False
+
+        if ok:
+            self.db.account_id = account_id
+            self.current_email = email
+            self.master_key = key
+            self.show_dashboard_screen()
+        else:
+            self.show_auth_error("Incorrect Master Password!")
+            self.master_pass_entry.delete(0, "end")
+            self.master_pass_entry.focus_set()
 
     def get_avatar_image(self, avatar_path, size=58):
         if not avatar_path or not os.path.exists(avatar_path):
@@ -362,6 +594,7 @@ class PasswordManagerApp(ctk.CTk):
 
     def show_dashboard_screen(self):
         """Renders Main Dashboard."""
+        self._on_activity()  # a fresh unlock always starts a fresh idle timer
         for widget in self.winfo_children():
             widget.destroy()
 
@@ -398,7 +631,7 @@ class PasswordManagerApp(ctk.CTk):
             fg_color="transparent" if avatar_image else "#1F6AA5",
             hover_color="#2B7DB8",
             font=("Arial", 16, "bold"),
-            command=self.show_profile_screen
+            command=lambda: self.show_profile_menu(profile_button)
         )
         profile_button.pack()
         profile_button.image = avatar_image
@@ -483,7 +716,9 @@ class PasswordManagerApp(ctk.CTk):
             filtered.append(r)
 
         if not filtered:
-            ctk.CTkLabel(self.scroll_frame, text="No credentials found.", font=("Arial", 14), text_color="gray").pack(pady=40)
+            empty_msg = ("Your vault is empty.\nClick \"(+) Add Entry\" to save your first credential."
+                         if not decrypted_records else "No credentials match your search or filter.")
+            ctk.CTkLabel(self.scroll_frame, text=empty_msg, font=("Arial", 14), text_color="gray", justify="center").pack(pady=40)
         else:
             for rec in filtered:
                 self.create_data_row(rec)
@@ -502,28 +737,119 @@ class PasswordManagerApp(ctk.CTk):
         btn_container = ctk.CTkFrame(row, fg_color="transparent")
         btn_container.pack(side="right", padx=10)
 
-        ctk.CTkButton(btn_container, text="Copy", width=55, height=26, fg_color="#3B8ED0", command=lambda p=record["password"]: self.copy_password(p)).pack(side="left", padx=2)
-        ctk.CTkButton(btn_container, text="Delete", width=55, height=26, fg_color="#D9534F", hover_color="#A52A2A", command=lambda i=record["id"]: self.delete_record(i)).pack(side="left", padx=2)
+        ctk.CTkButton(btn_container, text="Copy", width=50, height=26, fg_color="#3B8ED0", command=lambda p=record["password"]: self.copy_password(p)).pack(side="left", padx=2)
+        ctk.CTkButton(btn_container, text="Edit", width=50, height=26, command=lambda r=record: self.open_edit_modal(r)).pack(side="left", padx=2)
+        ctk.CTkButton(btn_container, text="Delete", width=50, height=26, fg_color="#D9534F", hover_color="#A52A2A", command=lambda i=record["id"], s=record["service"]: self.delete_record(i, s)).pack(side="left", padx=2)
+
+    def flash_status(self, text, color="#3B8ED0", ms=3000):
+        """Shows a temporary footer message, then restores the default status."""
+        if self._status_after_id:
+            self.after_cancel(self._status_after_id)
+        self.status_label.configure(text=text, text_color=color)
+        self._status_after_id = self.after(ms, self.reset_status)
+
+    def reset_status(self):
+        self._status_after_id = None
+        try:
+            self.status_label.configure(text="Status: 🔒 Vault Unlocked", text_color="#2FA572")
+        except Exception:
+            pass  # footer no longer exists (vault was locked)
 
     def copy_password(self, pwd):
         pyperclip.copy(pwd)
-        self.status_label.configure(text="Status: 📋 Password copied to clipboard (Clears in 15s)!", text_color="#3B8ED0")
-        # Auto-clear clipboard after 15 seconds
-        self.after(15000, self.clear_clipboard)
+        # Restart the 15s timer on every copy so an older timer can't wipe a newer copy early
+        if self._clipboard_after_id:
+            self.after_cancel(self._clipboard_after_id)
+        self._clipboard_after_id = self.after(15000, lambda: self.clear_clipboard(pwd))
+        self.flash_status("Status: 📋 Password copied to clipboard (clears in 15s)", ms=15000)
 
-    def clear_clipboard(self):
-        pyperclip.copy("")
-        self.status_label.configure(text="Status: 🔒 Vault Unlocked", text_color="#2FA572")
+    def clear_clipboard(self, pwd):
+        self._clipboard_after_id = None
+        try:
+            if pyperclip.paste() == pwd:  # don't wipe something else the user copied since
+                pyperclip.copy("")
+        except Exception:
+            pass
+        self.reset_status()
 
-    def save_new_record(self, category, service, username, password):
-        # Encrypt plaintext password before saving
+    def save_record(self, category, service, username, password, rec_id=None):
         encrypted_pwd = crypto_utils.encrypt_data(password, self.master_key)
-        self.db.add_credential(category, service, username, encrypted_pwd)
-        self.refresh_records_list()
 
-    def delete_record(self, rec_id):
+        if rec_id is None:
+            self.db.add_credential(category, service, username, encrypted_pwd)
+            status = "Status: ✅ Entry saved"
+        else:
+            self.db.update_credential(rec_id, category, service, username, encrypted_pwd)
+            status = "Status: ✅ Entry updated"
+
+        self.refresh_records_list()
+        self.flash_status(status, "#2FA572")
+
+    def open_edit_modal(self, record):
+        AddEditCredentialModal(self, on_save_callback=self.save_record, record=record)
+
+    def delete_record(self, rec_id, service=""):
+        if not messagebox.askyesno("Delete credential", f"Delete '{service}'?\nThis cannot be undone.", icon="warning", parent=self):
+            return
         self.db.delete_credential(rec_id)
         self.refresh_records_list()
+        self.flash_status("Status: 🗑 Entry deleted", "#D9534F")
+
+    def show_profile_menu(self, anchor_widget):
+        """Dropdown under the profile avatar: open profile, switch account, or add an account."""
+        menu = tk.Menu(self, tearoff=0, bg="#2B2B2B", fg="white", activebackground="#1F6AA5",
+                       activeforeground="white", bd=0, font=("Arial", 11))
+        menu.add_command(label="👤  My Profile", command=self.show_profile_screen)
+        menu.add_separator()
+
+        for acc_id, email, username, _avatar in self.db.get_accounts():
+            if acc_id == self.db.account_id:
+                menu.add_command(label=f"✓  {username} ({email})", state="disabled")
+            else:
+                menu.add_command(label=f"     {username} ({email})",
+                                 command=lambda e=email: self.switch_account(e))
+
+        menu.add_separator()
+        menu.add_command(label="➕  Add another account", command=lambda: self.show_auth_screen(mode="create"))
+
+        x = anchor_widget.winfo_rootx()
+        y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _on_activity(self, event=None):
+        self._last_activity = time.monotonic()
+
+    def _check_inactivity(self):
+        """Runs every second: warns shortly before locking, then locks after the idle timeout."""
+        try:
+            if self.master_key is not None and self.auto_lock_minutes > 0:
+                remaining = self.auto_lock_minutes * 60 - (time.monotonic() - self._last_activity)
+                if remaining <= 0:
+                    self.auto_lock()
+                elif remaining <= 10:
+                    try:
+                        self.flash_status(f"Status: ⏳ Auto-locking in {int(remaining) + 1}s - move the mouse or press a key to stay unlocked",
+                                          "#F0AD4E", ms=1500)
+                    except Exception:
+                        pass  # no footer on this screen (e.g. profile page)
+        finally:
+            self.after(1000, self._check_inactivity)
+
+    def auto_lock(self):
+        """Locks the vault: wipes the key from RAM and closes any open popups."""
+        self.show_auth_screen(mode="login", notice="🔒 Vault locked after inactivity")
+
+    def set_auto_lock(self, label):
+        self.auto_lock_minutes = AUTO_LOCK_OPTIONS.get(label, DEFAULT_AUTO_LOCK_MINUTES)
+        self.db.set_setting("auto_lock_minutes", self.auto_lock_minutes)
+        self._on_activity()
+
+    def switch_account(self, email):
+        """Locks the current account and asks for the other account's master password."""
+        self.show_auth_screen(mode="login", prefill_email=email)
 
     def show_profile_screen(self):
         for widget in self.winfo_children():
@@ -533,7 +859,13 @@ class PasswordManagerApp(ctk.CTk):
         username, avatar_path = profile
         initials = "".join(part[0] for part in username.split()[:2]).upper() or "P"
 
-        ctk.CTkButton(self, text="Back to Vault", width=120, command=self.show_dashboard_screen).pack(anchor="nw", padx=25, pady=20)
+        top_row = ctk.CTkFrame(self, fg_color="transparent")
+        top_row.pack(fill="x", padx=25, pady=20)
+        ctk.CTkButton(top_row, text="Back to Vault", width=120, command=self.show_dashboard_screen).pack(side="left")
+        autolock_menu = ctk.CTkOptionMenu(top_row, values=list(AUTO_LOCK_OPTIONS), width=115, command=self.set_auto_lock)
+        autolock_menu.set(next((l for l, m in AUTO_LOCK_OPTIONS.items() if m == self.auto_lock_minutes), "5 minutes"))
+        autolock_menu.pack(side="right")
+        ctk.CTkLabel(top_row, text="🔒 Auto-lock after:").pack(side="right", padx=(0, 8))
         ctk.CTkLabel(self, text="Your Profile", font=("Arial", 26, "bold")).pack(pady=(5, 15))
 
         avatar = ctk.CTkLabel(self, text=initials, width=150, height=150, corner_radius=75,
@@ -549,6 +881,7 @@ class PasswordManagerApp(ctk.CTk):
         avatar.pack(pady=10)
 
         ctk.CTkLabel(self, text=username, font=("Arial", 20, "bold")).pack(pady=5)
+        ctk.CTkLabel(self, text=self.current_email, text_color="gray").pack()
         ctk.CTkButton(self, text="Choose Profile Picture", command=self.choose_avatar).pack(pady=12)
 
         total_entries = len(self.db.get_all_credentials())
@@ -571,7 +904,7 @@ class PasswordManagerApp(ctk.CTk):
             self.show_profile_screen()
 
     def open_add_modal(self):
-        AddEditCredentialModal(self, on_save_callback=self.save_new_record)
+        AddEditCredentialModal(self, on_save_callback=self.save_record)
 
     def open_generator_modal(self):
         PasswordGeneratorModal(self)
